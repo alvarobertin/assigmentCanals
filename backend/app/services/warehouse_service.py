@@ -1,5 +1,5 @@
 import math
-from sqlalchemy import func
+from sqlalchemy import func, and_, or_
 from sqlalchemy.orm import Session
 
 from app.models import Warehouse, Inventory
@@ -51,48 +51,41 @@ def find_best_warehouse(
     if not items:
         return None
     
-    product_ids = [item[0] for item in items]
-    required_quantities = {item[0]: item[1] for item in items}
-    num_products = len(product_ids)
+    num_products = len(items)
     
-    # Find warehouses that have ALL products with sufficient quantity
-    # We do this by:
-    # 1. Filtering inventory entries for the requested products with enough stock
-    # 2. Grouping by warehouse
-    # 3. Counting distinct products - must equal total requested products
-    
-    # Subquery to get warehouses with sufficient stock for each product
-    qualifying_inventory = (
-        db.query(Inventory.warehouse_id, Inventory.product_id)
-        .filter(Inventory.product_id.in_(product_ids))
-    ).all()
-    
-    # Group by warehouse and check which ones have all products with sufficient qty
-    warehouse_products: dict[int, list[int]] = {}
-    for warehouse_id, product_id in qualifying_inventory:
-        # Get the actual inventory entry to check quantity
-        inv = db.query(Inventory).filter(
-            Inventory.warehouse_id == warehouse_id,
-            Inventory.product_id == product_id
-        ).first()
-        
-        if inv and inv.quantity >= required_quantities[product_id]:
-            if warehouse_id not in warehouse_products:
-                warehouse_products[warehouse_id] = []
-            warehouse_products[warehouse_id].append(product_id)
-    
-    # Find warehouses that have ALL products
-    qualifying_warehouse_ids = [
-        wh_id for wh_id, products in warehouse_products.items()
-        if len(products) == num_products
+    # Build conditions for each product with its required quantity
+    # Each condition checks: product_id matches AND quantity is sufficient
+    conditions = [
+        and_(
+            Inventory.product_id == product_id,
+            Inventory.quantity >= qty
+        )
+        for product_id, qty in items
     ]
+    
+    # Single query to find warehouses with ALL products in sufficient quantity:
+    # 1. Join Inventory with Warehouse
+    # 2. Filter: inventory matches ANY of our (product_id, quantity) conditions
+    # 3. Group by warehouse_id
+    # 4. HAVING: count of matching products equals total required products
+    #    (ensures warehouse has ALL products, not just some)
+    qualifying_warehouse_ids = (
+        db.query(Inventory.warehouse_id)
+        .filter(or_(*conditions))
+        .group_by(Inventory.warehouse_id)
+        .having(func.count(Inventory.product_id) == num_products)
+        .all()
+    )
     
     if not qualifying_warehouse_ids:
         return None
     
+    # Extract IDs from result tuples
+    warehouse_ids = [row[0] for row in qualifying_warehouse_ids]
+    
     # Get warehouse details
     warehouses = db.query(Warehouse).filter(
-        Warehouse.id.in_(qualifying_warehouse_ids)
+        Warehouse.id.in_(warehouse_ids)
     ).all()
     
     if not warehouses:
